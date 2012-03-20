@@ -25,7 +25,8 @@
 #define RESP_STR_LEN            PAGE_SIZE
 
 /* Buffer size for firewall rules */
-#define MAX_RULES               99
+/* TODO: Use kernel linked list */
+#define MAX_RULES               20
 
 /* These hook points are supposed to be defined in netfilter.h */
 #ifndef NF_IP_LOCAL_IN
@@ -52,6 +53,7 @@ typedef enum
     TASK_DELETE     = 4
 } task_t;
 
+
 /* Direction of packet for a firewall rule */
 typedef enum
 {
@@ -60,6 +62,15 @@ typedef enum
     DIR_OUT         = 2
 } direction_t;
 
+/* Provides the name of the values in direction_t enum */
+inline char* dir_str(direction_t dir)
+{
+    if (dir == DIR_IN) return "IN";
+    else if (dir == DIR_OUT) return "OUT";
+    else return "?";
+}
+
+
 /* Action to be taken in a firewall rule */
 typedef enum
 {
@@ -67,6 +78,15 @@ typedef enum
     ACT_BLOCK       = 1,
     ACT_UNBLOCK     = 2
 } action_t;
+
+/* Provides the name of the values in action_t enum */
+inline char* act_str(action_t act)
+{
+    if (act == ACT_BLOCK) return "BLOCK";
+    else if (act == ACT_UNBLOCK) return "ALLOW";
+    else return "?";
+}
+
 
 /* Struct for firewall rule */
 typedef struct rule_s
@@ -104,7 +124,7 @@ static struct   proc_dir_entry *proc_entry = NULL;
 static char*    resp_str = NULL;
 static int      pos = 0;
 
-/* Storage for firewall rules */
+/* Simple storage for firewall rules */
 static rule_t   rules[MAX_RULES];
 
 /* Firewall hooks */
@@ -131,9 +151,11 @@ static struct   nf_hook_ops out_hook;
  */
 bool match_ip_addr(int rule_ip, int rule_netmask, int traffic_ip)
 {
+    /* effective IP addresses for comparison: IP address _and_ mask */
     int eff_rule_ip = rule_ip;
     int eff_skb_ip  = traffic_ip;
     
+    /* netmask = 0 means there is no net mask */
     if (rule_netmask)
     {
         eff_rule_ip &= rule_netmask;
@@ -143,10 +165,23 @@ bool match_ip_addr(int rule_ip, int rule_netmask, int traffic_ip)
     return (eff_rule_ip == eff_skb_ip);
 }
 
-/* A rule with no parameter will match everything */
+/**
+ * \brief   Checks if a given packet matches a given rule.
+ *          A rule with no parameter will match all packets.
+ * \param   p_rule      pointer to the rule for matching
+ * \param   p_skb       pointer to the socket buffer for matching
+ * \return  true if match, false if not match
+ */
 bool match_rule(const rule_t* p_rule, const struct sk_buff* p_skb)
 {
-    //Source IP (with mask)
+    /* Protocol: check the IP header */
+    if (p_rule->proto)
+    {
+        if (p_rule->proto_n != ip_hdr(p_skb)->protocol)
+            return false;
+    }
+
+    /* Source IP (with mask): check the IP header */
     if (p_rule->srcip &&
         !match_ip_addr(p_rule->srcip_n, p_rule->srcnetmask_n,
                        ip_hdr(p_skb)->saddr))
@@ -154,16 +189,17 @@ bool match_rule(const rule_t* p_rule, const struct sk_buff* p_skb)
         return false;
     }
     
-    //Destination port
+    /* Source port: only applicable for TCP and UDP packets.
+       Check the TCP/UDP header depending on the protocol.
+       If checking port number does not make sense for the packet's protocol,
+       the port parameter is ignored. */
     if (p_rule->srcport)
     {
-        //TCP
         if (ip_hdr(p_skb)->protocol == PROTO_TCP)
         {
             if (p_rule->srcport_n != ntohs(tcp_hdr(p_skb)->source))
                 return false;
         }
-        //UDP
         else if (ip_hdr(p_skb)->protocol == PROTO_UDP)
         {
             if (p_rule->srcport_n != ntohs(udp_hdr(p_skb)->source))
@@ -171,7 +207,7 @@ bool match_rule(const rule_t* p_rule, const struct sk_buff* p_skb)
         }
     }
     
-    //Destination IP (with mask)
+    /* Destination IP (with mask): check the IP header */
     if (p_rule->destip &&
         !match_ip_addr(p_rule->destip_n, p_rule->destnetmask_n,
                        ip_hdr(p_skb)->daddr))
@@ -179,16 +215,17 @@ bool match_rule(const rule_t* p_rule, const struct sk_buff* p_skb)
         return false;
     }
     
-    //Destination port
+    /* Destination port: only applicable for TCP and UDP packets.
+       Check the TCP/UDP header depending on the protocol.
+       If checking port number does not make sense for the packet's protocol,
+       the port parameter is ignored. */
     if (p_rule->destport)
     {
-        //TCP
         if (ip_hdr(p_skb)->protocol == PROTO_TCP)
         {
             if (p_rule->destport_n != ntohs(tcp_hdr(p_skb)->dest))
                 return false;
         }
-        //UDP
         else if (ip_hdr(p_skb)->protocol == PROTO_UDP)
         {
             if (p_rule->destport_n != ntohs(udp_hdr(p_skb)->dest))
@@ -196,22 +233,34 @@ bool match_rule(const rule_t* p_rule, const struct sk_buff* p_skb)
         }
     }
     
-    if (p_rule->proto)
-    {
-        if (p_rule->proto_n != ip_hdr(p_skb)->protocol)
-            return false;
-    }
-    
+    /* If it reaches here, then all parameters in the rule must have matched
+       or there are no parameters in the rule. */
     return true;
 }
 
-unsigned int match_rules(direction_t dir, struct sk_buff* p_skb)
+/**
+ * \brief   Attempts to match the packet with the configured rules
+ *          and return the action that has to be taken.
+ *
+ *          Rules with lower index has higher priority. That is, rules are
+ *          tested for match from the lower index. Once a match is found,
+ *          the configured action for that particular rule will be taken.
+ *
+ *          Because this firewall is blacklist-based, if no rule matches,
+ *          we let the packet pass.
+ *
+ * \param   dir     packet direction
+ * \param   p_skb   pointer to the socket buffer containing the packet
+ * \return  NF_ACCEPT if the packet shall not be blocked, or
+ *          NF_DROP   if the packet shall be blocked
+ */
+unsigned int match_rules(direction_t dir, const struct sk_buff* p_skb)
 {
-    size_t i;
-    for (i = 0; i < MAX_RULES; ++i) //TODO: Keep track of the last rule
+    size_t i = 0;
+    for (i = 0; i < MAX_RULES; ++i)
     {
-        if (rules[i].used &&
-            rules[i].direction == dir &&
+        if (rules[i].used &&                /* Only check active rules */
+            rules[i].direction == dir &&    /* Match the packet direction */
             match_rule(&rules[i], p_skb))
         {
             return (rules[i].action == ACT_BLOCK) ? NF_DROP : NF_ACCEPT;
@@ -232,6 +281,7 @@ unsigned int in_hook_func(unsigned int hooknum,
     return match_rules(DIR_IN, skb);
 }
 
+/* Hook function for outgoing packets */
 unsigned int out_hook_func(unsigned int hooknum,
                            struct sk_buff *skb,
                            const struct net_device *in,
@@ -266,20 +316,6 @@ void print_instruction(void)
     printr("  --destport N    : Destination IP address\n");
 }
 
-inline char* dir_str(direction_t dir)
-{
-    if (dir == DIR_IN) return "IN";
-    else if (dir == DIR_OUT) return "OUT";
-    else return "?";
-}
-
-inline char* act_str(action_t act)
-{
-    if (act == ACT_BLOCK) return "BLOCK";
-    else if (act == ACT_UNBLOCK) return "ALLOW";
-    else return "?";
-}
-
 void print_heading(void)
 {
     printr("NO  DIR  ACT    PROTO  SRC_IP           SRC_NET_MASK     SPORT  ");
@@ -306,6 +342,24 @@ void print_rule(const rule_t *p_rule)
            );
 }
 
+void print_rules(void)
+{
+    int i = 0;
+    print_heading();
+    for (i = 0; i < MAX_RULES; ++i)
+    {
+        if (rules[i].used)
+            print_rule(&rules[i]);
+    } 
+}
+
+/**
+ * \brief   Get an empty rule slot with the smallest index
+ *          See create_new_rule() for detail on slot assignment scheme
+ *          Slot id is index + 1 (first slot has id=1)
+ * \param   p_id    [out] identifier of the empty slot
+ * \return  pointer to the empty slot
+ */
 rule_t* get_empty_slot(int* p_id)
 {
     int i = 0;
@@ -320,6 +374,17 @@ rule_t* get_empty_slot(int* p_id)
     return NULL;
 }
 
+/**
+ * \brief   Store a new rule based on the parsed command, does not check if
+ *          the rule makes sense or not.
+ *          The newly created rule will be given the highest priority that is
+ *          not already taken. If e.g. priority 1 and 3 are used but priority 2
+ *          has been deleted, then the newly created rule will be given
+ *          priority 2 (instead of 4).
+ * \param   p_rule  the rule to be stored
+ * \return  true if the rule is stored successfully (there is an empty slot)
+ *          false otherwise
+ */       
 bool create_new_rule(const rule_t *p_rule)
 {
     int id = 0;
@@ -327,7 +392,7 @@ bool create_new_rule(const rule_t *p_rule)
     rule_t* p_slot = get_empty_slot(&id);
     if (!p_slot)
     {
-        printr("This firewall only support up to 99 rules.\n");
+        printr("This firewall only support up to %d rules.\n", MAX_RULES);
         return false;
     }
     
@@ -342,20 +407,7 @@ bool create_new_rule(const rule_t *p_rule)
     return true;
 }
 
-void print_rules(void)
-{
-    int i = 0;
-    
-    print_heading();
-    for (i = 0; i < MAX_RULES; ++i)
-    {
-        if (rules[i].used)
-        {
-            print_rule(&rules[i]);
-        }
-    } 
-}
-
+/* When we delete a rule, we just mark the slot as unused. */
 bool delete_rule(int id)
 {
     if (id < 1 || id > MAX_RULES || !rules[id - 1].used)
@@ -370,12 +422,7 @@ bool delete_rule(int id)
     return true;
 }
 
-#define ASSERT_SET_ONCE(var, val)\
-    if (var && var != val)  goto arg_exception;\
-    var = val;
-
-#define NEXT_ARG strsep(&running_str, " ")
-
+/* Wrapper for simple_strtol to make it work like atoi() in libc */
 inline int __atoi(const char* str)
 {
     char* endp = NULL;
@@ -386,18 +433,40 @@ inline int __atoi(const char* str)
 /* For strnicmp() below. Max length is irrelevant. */
 #define NO_MAX_LEN 99999
 
-inline int get_proto_id(const char* str)
+/**
+ * \brief   Returns the protocol number for the given protocol name.
+ *          Only has the code for ICMP, TCP, and UDP.
+ *          Supposed to use getprotobyname() but no equivalent in kernel?
+ * \param   proto_name      protocol name (case-insensitive)
+ * \return  protocol number if a definition is available, 0 if no match
+ */
+inline int get_proto_id(const char* proto_name)
 {
-    if (strnicmp(str, "icmp", NO_MAX_LEN) == 0) 
+    if (strnicmp(proto_name, "icmp", NO_MAX_LEN) == 0) 
         return PROTO_ICMP;
-    else if (strnicmp(str, "tcp", NO_MAX_LEN) == 0) 
+    else if (strnicmp(proto_name, "tcp", NO_MAX_LEN) == 0) 
         return PROTO_TCP;
-    else if (strnicmp(str, "udp", NO_MAX_LEN) == 0)
+    else if (strnicmp(proto_name, "udp", NO_MAX_LEN) == 0)
         return PROTO_UDP;
     else
         return 0;
 }
 
+/* Sanity check the command arguments.
+   Each option in a rule can only be defined once. */
+#define ASSERT_SET_ONCE(var, val)\
+    if (var && var != val)  goto arg_exception;\
+    var = val;
+
+/* Helper macro for parsing arguments */
+#define NEXT_ARG strsep(&running_str, " ")
+
+/**
+ * \brief   Parses a command passed from userland and performs the action
+ * \param   cmd_str     command string containing CLI arguments,
+ *                      separated by whitespaces
+ * \return  0 if command is parsed successfully, an error code on failure
+ */
 int parse_cmd(const char* cmd_str)
 {
     int ret_val = 0, rule_to_delete = 0;
@@ -519,6 +588,7 @@ cleanup:
     return ret_val;
 }
 
+/* Callback function when a process reads from the proc file */
 int mfconfig_read(char* page, char** start, off_t off,
                   int count, int *eof, void *data)
 {
@@ -529,17 +599,21 @@ int mfconfig_read(char* page, char** start, off_t off,
         
     len = sprintf(page, "%s", resp_str);
     
+    /* Reset the response buffer */
     pos = 0;
     memset(resp_str, 0, RESP_STR_LEN);
     
     return len;
 }
 
+/* Callback function when a process writes to the proc file */
 ssize_t mfconfig_write(struct file *filp, const char __user *buff,
                        unsigned long len, void *data)
 {
     int result = 0;
     
+    /* The passed in buff is not null terminated,
+       so we need to make a copy and null-terminate it. */
     char* cmd_str = (char*) vmalloc(len + 1);
     if (!cmd_str)
     {
@@ -549,15 +623,27 @@ ssize_t mfconfig_write(struct file *filp, const char __user *buff,
     
     copy_from_user(cmd_str, buff, len);
     cmd_str[len] = 0;
+    
     result = parse_cmd(cmd_str);
+    
     vfree(cmd_str);
     cmd_str = NULL;
     
     return len;
 }
 
+/**
+ * \brief   Initializes the kernel module when it is loaded for the first time.
+ *          Prepares the procfs-based I/O for communicating with userland
+ *          and places the netfilter hooks.
+ * \return  0 if initialization is successful, other error codes otherwise
+ */
 int init_module(void)
 {
+    memset(rules, 0, MAX_RULES * sizeof(rule_t));
+    
+    /*** Userland I/O via proc initialization ***/    
+    
     resp_str = (char*) vmalloc(RESP_STR_LEN);
     if (!resp_str)
     {
@@ -566,8 +652,6 @@ int init_module(void)
     }
     
     memset(resp_str, 0, RESP_STR_LEN);
-    
-    memset(rules, 0, MAX_RULES * sizeof(rule_t));
 
     proc_entry= create_proc_entry("minifirewall", 0644, NULL);
     if (!proc_entry)
@@ -579,14 +663,16 @@ int init_module(void)
     proc_entry->read_proc = mfconfig_read;
     proc_entry->write_proc = mfconfig_write;
     
-    /* IN filter */
+    /*** Firewall initialization ***/
+    
+    /* create and register IN filter */
     in_hook.hook        = in_hook_func;
     in_hook.hooknum     = NF_IP_LOCAL_IN;
     in_hook.pf          = PF_INET;
     in_hook.priority    = NF_IP_PRI_FIRST;
     nf_register_hook(&in_hook);
     
-    /* OUT filter */
+    /* create and register OUT filter */
     out_hook.hook       = out_hook_func;
     out_hook.hooknum    = NF_IP_LOCAL_OUT;
     out_hook.pf         = PF_INET;
@@ -596,8 +682,15 @@ int init_module(void)
     return 0;
 }
 
+/**
+ * \brief   Cleans up the memory used in procfs I/O mechanism
+ *          and removes the netfilter hooks.
+ *          Called when this kernel module is unloaded.
+ */
 void cleanup_module(void)
 {
+    /*** Clean up the procfs entry ***/
+    
     if (resp_str)
     {
         vfree(resp_str);
@@ -605,6 +698,8 @@ void cleanup_module(void)
     }
     
     remove_proc_entry("minifirewall", NULL);
+    
+    /*** Remove the netfilter hooks ***/
     
     nf_unregister_hook(&in_hook);
     nf_unregister_hook(&out_hook);

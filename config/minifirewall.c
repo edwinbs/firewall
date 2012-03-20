@@ -1,3 +1,14 @@
+/**
+ * minifirewall.c
+ *
+ * Configuration utility for the mini firewall kernel obejct.
+ * This utility simply passes the command line arguments to the kernel.
+ * Parsing is done by the kernel.
+ *
+ * \author  Edwin Boaz Soenaryo (A0082245J)
+ * \email   edwinbs@comp.nus.edu.sg
+ */
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -13,6 +24,13 @@ void send_kernel_msg(const char* msg)
     char resp_buf[BUF_LEN] = { 0 };
     
     fd = open(PROC_FNAME, O_WRONLY);
+    
+    if (!fd)
+    {
+        printf("Unable to communicate with minifirewall kernel object.\n");
+        return;
+    }
+    
     write(fd, msg, strlen(msg));
     close(fd);
     
